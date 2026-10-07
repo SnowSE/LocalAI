@@ -1,0 +1,227 @@
+@page "/chat"
+@inherits DemoPage
+@inject LocalAIModels Models
+@inject IChatClient Chat
+
+<PageTitle>LocalAI: Chat</PageTitle>
+
+<h1>Chat</h1>
+<p class="lede">A conversation that streams token by token. Change the system prompt or the sampler between turns, and stop a reply halfway.</p>
+
+<div class="split">
+    <div class="demo">
+        <ModelGate Slot="Models.Chat" ConfigKey="Chat" AutoLoad="true" Context="model">
+            <div class="settings">
+                <label class="field">
+                    <span class="field__label">System prompt</span>
+                    <textarea class="input" rows="2" @bind="_systemPrompt" disabled="@_busy"></textarea>
+                </label>
+                <div class="settings__row">
+                    <label class="field">
+                        <span class="field__label">Sampler</span>
+                        <select class="input" @bind="_sampler" disabled="@_busy">
+                            <option value="default">Default</option>
+                            <option value="greedy">Greedy (always the likeliest token)</option>
+                            <option value="temperature">Temperature</option>
+                        </select>
+                    </label>
+                    @if (_sampler == "temperature")
+                    {
+                        <label class="field">
+                            <span class="field__label">Temperature @_temperature.ToString("F1")</span>
+                            <input type="range" min="0" max="2" step="0.1" @bind="_temperature" @bind:event="oninput" disabled="@_busy" />
+                        </label>
+                    }
+                    <label class="check">
+                        <input type="checkbox" @bind="_thinking" disabled="@_busy" />
+                        Let it think first
+                    </label>
+                </div>
+            </div>
+
+            <ol class="transcript" aria-live="polite">
+                @foreach (var turn in _turns)
+                {
+                    <li class="turn turn--@turn.Role">
+                        <span class="turn__role">@(turn.Role == "user" ? "You" : "Model")</span>
+                        @if (turn.Reply is { } reply)
+                        {
+                            @if (reply.Thought.Length > 0)
+                            {
+                                <details class="thought" open="@reply.Thinking">
+                                    <summary>@(reply.Thinking ? "Thinking…" : "Reasoning")</summary>
+                                    <p>@reply.Thought.Trim()</p>
+                                </details>
+                            }
+                            <Markdown Class="turn__text" Text="@reply.Text" />
+                            @if (reply.Stopped)
+                            {
+                                <span class="turn__note">Stopped</span>
+                            }
+                        }
+                        else
+                        {
+                            <Markdown Class="turn__text" Text="@turn.Text" />
+                        }
+                    </li>
+                }
+                @if (_turns.Count == 0)
+                {
+                    <li class="transcript__empty">Send a message to start the conversation.</li>
+                }
+            </ol>
+
+            <form class="ask" @onsubmit="Send" @onsubmit:preventDefault>
+                <label class="visually-hidden" for="chat-input">Message</label>
+                <div class="ask__row">
+                    <input id="chat-input" class="input" @bind="_input" @bind:event="oninput" placeholder="Write a message" disabled="@_busy" autocomplete="off" />
+                    @if (_busy)
+                    {
+                        <button type="button" class="button" @onclick="Stop">Stop</button>
+                    }
+                    else
+                    {
+                        <button type="submit" class="button button--primary" disabled="@string.IsNullOrWhiteSpace(_input)">Send</button>
+                    }
+                </div>
+            </form>
+
+            <div class="readout-bar">
+                @if (_usage is { } usage && usage.ContextSize() is { } size)
+                {
+                    var used = (usage.InputTokenCount ?? 0) + (usage.OutputTokenCount ?? 0);
+                    <span>Context: @used of @size tokens</span>
+                    <meter min="0" max="@size" value="@used" aria-label="Context used"></meter>
+                }
+                @if (_tokensPerSecond is { } tps)
+                {
+                    <span>@tps.ToString("F1") tokens per second</span>
+                }
+                <button class="button button--small" @onclick="Reset" disabled="@_busy">Clear conversation</button>
+            </div>
+            @if (_error is not null)
+            {
+                <p class="gate__error" role="alert">@_error</p>
+            }
+        </ModelGate>
+    </div>
+
+    <CodeSample Code="@Code">
+        Like every <code>IChatClient</code>, it's stateless: the page keeps the history and sends it each turn. A local model keeps the conversation it last saw cached, so only the new message is processed. Cancelling stops generation in the model, not only the wait.
+    </CodeSample>
+</div>
+
+@code {
+    private const string Code = """
+// Injected: an IChatClient backed by a local GGUF model
+// (or a hosted one, if appsettings.json says so).
+List<ChatMessage> history = [new(ChatRole.System, systemPrompt)];
+history.Add(new(ChatRole.User, message));
+
+var options = new ChatOptions { Temperature = 0.7f }
+    .WithThinking(false);
+
+await foreach (var update in chat.GetStreamingResponseAsync(
+    history, options, stop))
+{
+    foreach (var content in update.Contents)
+    {
+        if (content is TextReasoningContent thought) ...
+        if (content is TextContent text) reply += text.Text;
+    }
+}
+history.Add(new(ChatRole.Assistant, reply));
+""";
+
+    private sealed class Turn(string role, string text, Reply? reply = null)
+    {
+        public string Role { get; } = role;
+        public string Text { get; } = text;
+        public Reply? Reply { get; } = reply;
+    }
+
+    private readonly List<Turn> _turns = [];
+    private readonly List<ChatMessage> _history = [];
+    private string _systemPrompt = "You are a friendly assistant. Keep answers short.";
+    private string _sampler = "default";
+    private float _temperature = 0.7f;
+    private bool _thinking;
+    private string _input = "";
+    private bool _busy;
+    private string? _error;
+    private UsageDetails? _usage;
+    private double? _tokensPerSecond;
+    private CancellationTokenSource? _cts;
+
+    private ChatOptions Options()
+    {
+        var options = new ChatOptions().WithThinking(_thinking);
+        options.Temperature = _sampler switch
+        {
+            "greedy" => 0f,
+            "temperature" => _temperature,
+            _ => null,
+        };
+        return options;
+    }
+
+    private Task Send() => Guard(async () =>
+    {
+        if (string.IsNullOrWhiteSpace(_input))
+            return;
+        var message = _input.Trim();
+        _input = "";
+        _error = null;
+        _turns.Add(new Turn("user", message));
+        var reply = new Reply();
+        _turns.Add(new Turn("model", "", reply));
+        _history.Add(new ChatMessage(ChatRole.User, message));
+
+        // The system prompt can change between turns, so it's sent fresh each time.
+        List<ChatMessage> messages = string.IsNullOrWhiteSpace(_systemPrompt)
+            ? [.. _history]
+            : [new(ChatRole.System, _systemPrompt), .. _history];
+
+        _busy = true;
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(Alive);
+        var stopwatch = new Stopwatch();
+        try
+        {
+            await foreach (var update in Chat.GetStreamingResponseAsync(messages, Options(), _cts.Token))
+            {
+                if (!stopwatch.IsRunning)
+                    stopwatch.Start();
+                reply.Add(update);
+                StateHasChanged();
+            }
+            _usage = reply.Usage ?? _usage;
+        }
+        catch (OperationCanceledException) when (!IsDisposed)
+        {
+            reply.Stopped = true;
+        }
+        catch (Exception e) when (e is InvalidOperationException or NotSupportedException or HttpRequestException)
+        {
+            _error = e.Message;
+        }
+        finally
+        {
+            reply.Done = true;
+            _tokensPerSecond = reply.Tokens / Math.Max(stopwatch.Elapsed.TotalSeconds, 0.001);
+            _busy = false;
+            // Even a stopped reply joins the history, so the conversation stays coherent.
+            if (reply.Text.Length > 0)
+                _history.Add(new ChatMessage(ChatRole.Assistant, reply.Text));
+        }
+    });
+
+    private void Stop() => _cts?.Cancel();
+
+    private void Reset()
+    {
+        _history.Clear();
+        _turns.Clear();
+        _usage = null;
+        _tokensPerSecond = null;
+    }
+}

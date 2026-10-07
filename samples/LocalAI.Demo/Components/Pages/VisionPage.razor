@@ -1,0 +1,124 @@
+@page "/vision"
+@inherits DemoPage
+@using Microsoft.Extensions.DependencyInjection
+@inject LocalAIModels Models
+@inject IServiceProvider Services
+
+<PageTitle>LocalAI: Images</PageTitle>
+
+<h1>Images</h1>
+<p class="lede">
+    A multimodal model reads images as part of the prompt. Upload a picture and ask about it; with a
+    local model the image never leaves this machine.
+</p>
+
+<div class="split">
+    <div class="demo">
+        <ModelGate Slot="Models.Vision" ConfigKey="Vision" Context="model">
+            <ChildContent>
+                <label class="field">
+                    <span class="field__label">Image (PNG or JPEG, up to 10 MB)</span>
+                    <InputFile class="input" accept="image/png,image/jpeg" OnChange="Upload" disabled="@_busy" />
+                </label>
+                @if (_image is not null)
+                {
+                    <img class="preview" src="@_image.Uri" alt="The uploaded image" />
+                }
+                <form class="ask" @onsubmit="Ask" @onsubmit:preventDefault>
+                    <label class="field__label" for="vision-question">Question</label>
+                    <div class="ask__row">
+                        <input id="vision-question" class="input" @bind="_question" @bind:event="oninput" disabled="@_busy" autocomplete="off" />
+                        <button type="submit" class="button button--primary" disabled="@(_busy || _image is null)">Ask</button>
+                    </div>
+                </form>
+                @if (_answer.Text.Length > 0)
+                {
+                    <div class="answer" aria-live="polite"><Markdown Text="@_answer.Text" /></div>
+                }
+                @if (_error is not null)
+                {
+                    <p class="gate__error" role="alert">@_error</p>
+                }
+            </ChildContent>
+            <NotConfiguredContent>
+                <p>
+                    A local vision model also needs its projection file in <code>LocalAI:Vision:Projection</code>. For example,
+                    Gemma 4 E2B (about 4 GB with its projection):
+                </p>
+                <pre><code>"Vision": {
+  "Model": "hf://bartowski/google_gemma-4-E2B-it-GGUF/google_gemma-4-E2B-it-Q4_K_M.gguf",
+  "Projection": "hf://bartowski/google_gemma-4-E2B-it-GGUF/mmproj-google_gemma-4-E2B-it-f16.gguf"
+}</code></pre>
+                <p>Or a hosted one: <code>"Vision": { "Provider": "OpenAI", "Model": "gpt-5-mini" }</code>.</p>
+            </NotConfiguredContent>
+        </ModelGate>
+    </div>
+
+    <CodeSample Code="@Code" />
+</div>
+
+@code {
+    private const string Code = """
+// Injected with [FromKeyedServices("vision")]
+var message = new ChatMessage(ChatRole.User,
+[
+    new DataContent(imageBytes, "image/jpeg"),
+    new TextContent("What is in this picture?"),
+]);
+
+await foreach (var update in vision.GetStreamingResponseAsync([message]))
+    Console.Write(update.Text);
+""";
+
+    private DataContent? _image;
+    private string _question = "What is in this picture?";
+    private readonly Reply _answer = new();
+    private string? _error;
+    private bool _busy;
+
+    private IChatClient Vision => Services.GetRequiredKeyedService<IChatClient>(LocalAIServiceCollectionExtensions.VisionKey);
+
+    private async Task Upload(InputFileChangeEventArgs e)
+    {
+        _error = null;
+        _answer.Clear();
+        _image = null;
+        try
+        {
+            using var buffer = new MemoryStream();
+            await e.File.OpenReadStream(maxAllowedSize: 10 * 1024 * 1024).CopyToAsync(buffer);
+            _image = new DataContent(buffer.ToArray(), e.File.ContentType == "image/png" ? "image/png" : "image/jpeg");
+        }
+        catch (IOException ex)
+        {
+            _error = $"The image couldn't be uploaded: {ex.Message}";
+        }
+    }
+
+    private Task Ask() => Guard(async () =>
+    {
+        if (_image is null)
+            return;
+        _busy = true;
+        _answer.Clear();
+        _error = null;
+        try
+        {
+            var message = new ChatMessage(ChatRole.User, [_image, new TextContent(_question)]);
+            await foreach (var update in Vision.GetStreamingResponseAsync([message], new ChatOptions().WithThinking(false), Alive))
+            {
+                _answer.Add(update);
+                StateHasChanged();
+            }
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or HttpRequestException)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _answer.Done = true;
+            _busy = false;
+        }
+    });
+}

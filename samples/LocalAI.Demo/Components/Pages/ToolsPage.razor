@@ -1,0 +1,195 @@
+@page "/tools"
+@inherits DemoPage
+@inject LocalAIModels Models
+@inject IChatClient Chat
+
+<PageTitle>LocalAI: Tool calling</PageTitle>
+
+<h1>Tool calling</h1>
+<p class="lede">
+    The model can call C# functions while it answers. Each tool below is an ordinary lambda, made into an
+    <code>AIFunction</code>. A local model turns their parameter types into a grammar, so even this small
+    model always produces a valid call.
+</p>
+
+<div class="split">
+    <div class="demo">
+        <ModelGate Slot="Models.Chat" ConfigKey="Chat" AutoLoad="true" Context="model">
+            <div class="suggestions" role="group" aria-label="Try one of these">
+                @foreach (var suggestion in Suggestions)
+                {
+                    <button class="chip" @onclick="() => Send(suggestion)" disabled="@_busy">@suggestion</button>
+                }
+            </div>
+
+            <form class="ask" @onsubmit="() => Send(_input)" @onsubmit:preventDefault>
+                <label class="visually-hidden" for="tools-input">Message</label>
+                <div class="ask__row">
+                    <input id="tools-input" class="input" @bind="_input" @bind:event="oninput" placeholder="Ask something the tools can answer" disabled="@_busy" autocomplete="off" />
+                    <button type="submit" class="button button--primary" disabled="@(_busy || string.IsNullOrWhiteSpace(_input))">Send</button>
+                </div>
+            </form>
+
+            <ol class="transcript" aria-live="polite">
+                @foreach (var entry in _entries)
+                {
+                    @switch (entry)
+                    {
+                        case Entry.Said said:
+                            <li class="turn turn--@said.Role">
+                                <span class="turn__role">@(said.Role == "user" ? "You" : "Model")</span>
+                                <Markdown Class="turn__text" Text="@said.Text" />
+                            </li>
+                            break;
+                        case Entry.Called called:
+                            <li class="turn turn--tool">
+                                <span class="turn__role">Called <code>@called.Name</code></span>
+                                <dl class="call">
+                                    <dt>Arguments</dt><dd><code>@called.Arguments</code></dd>
+                                    <dt>Returned</dt><dd><code>@(called.Result ?? "…")</code></dd>
+                                </dl>
+                            </li>
+                            break;
+                    }
+                }
+                @if (_entries.Count == 0)
+                {
+                    <li class="transcript__empty">Pick a question above. Each tool call shows up here as it happens.</li>
+                }
+            </ol>
+        </ModelGate>
+    </div>
+
+    <CodeSample Code="@Code">
+        The injected <code>IChatClient</code> includes Microsoft.Extensions.AI's <code>FunctionInvokingChatClient</code>, so tools run automatically and their results go back to the model. It works the same with a hosted model.
+    </CodeSample>
+</div>
+
+@code {
+    private const string Code = """
+var weather = AIFunctionFactory.Create(
+    ([Description("The city")] string city,
+     TemperatureUnit unit) => Forecast(city, unit),
+    "get_weather", "Get the current weather for a city");
+
+var calculate = AIFunctionFactory.Create(
+    (double a, Operation operation, double b) => ...,
+    "calculate", "Do arithmetic on two numbers");
+
+var clock = AIFunctionFactory.Create(
+    () => DateTime.Now.ToString("f"),
+    "current_time", "Get the current date and time");
+
+var options = new ChatOptions { Tools = [weather, calculate, clock] };
+var response = await chat.GetResponseAsync(question, options);
+""";
+
+    public enum TemperatureUnit { Celsius, Fahrenheit }
+
+    public enum Operation { Add, Subtract, Multiply, Divide }
+
+    private abstract record Entry
+    {
+        public sealed record Said(string Role, string Text) : Entry;
+
+        public sealed record Called(string CallId, string Name, string Arguments) : Entry
+        {
+            public string? Result { get; set; }
+        }
+    }
+
+    private static readonly string[] Suggestions =
+    [
+        "What's the weather in Oslo, in Fahrenheit?",
+        "What is 1234 multiplied by 5678?",
+        "What time is it right now?",
+    ];
+
+    private static readonly AIFunction[] Tools = [Weather(), Calculator(), Clock()];
+
+    private readonly List<Entry> _entries = [];
+    private string _input = "";
+    private bool _busy;
+
+    private static AIFunction Weather() => AIFunctionFactory.Create(
+        ([Description("The city name")] string city, [Description("The unit to report the temperature in")] TemperatureUnit unit) =>
+        {
+            // Made up, but the same city always gets the same weather.
+            var seed = city.ToLowerInvariant().Aggregate(17, (h, c) => h * 31 + c);
+            var celsius = Math.Abs(seed % 30) - 5;
+            string[] skies = ["sunny", "cloudy", "rainy", "windy", "snowing"];
+            var temperature = unit == TemperatureUnit.Celsius ? celsius : celsius * 9 / 5 + 32;
+            return new { city, temperature, unit = unit.ToString(), sky = skies[Math.Abs(seed) % skies.Length] };
+        },
+        "get_weather", "Get the current weather for a city");
+
+    private static AIFunction Calculator() => AIFunctionFactory.Create(
+        (double a, Operation operation, double b) => operation switch
+        {
+            Operation.Add => a + b,
+            Operation.Subtract => a - b,
+            Operation.Multiply => a * b,
+            Operation.Divide => a / b,
+            _ => double.NaN,
+        },
+        "calculate", "Do arithmetic on two numbers");
+
+    private static AIFunction Clock() => AIFunctionFactory.Create(
+        () => DateTime.Now.ToString("dddd d MMMM yyyy, HH:mm"),
+        "current_time", "Get the current date and time");
+
+    private Task Send(string message) => Guard(async () =>
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return;
+        _input = "";
+        _busy = true;
+        _entries.Add(new Entry.Said("user", message.Trim()));
+        var answer = new Entry.Said("model", "");
+        try
+        {
+            List<ChatMessage> messages =
+            [
+                new(ChatRole.System, "You are a helpful assistant. Use the tools to answer, then reply in one sentence."),
+                new(ChatRole.User, message.Trim()),
+            ];
+            var options = new ChatOptions { Tools = Tools }.WithThinking(false);
+            var text = "";
+            await foreach (var update in Chat.GetStreamingResponseAsync(messages, options, Alive))
+            {
+                foreach (var content in update.Contents)
+                {
+                    switch (content)
+                    {
+                        case FunctionCallContent call:
+                            _entries.Add(new Entry.Called(call.CallId, call.Name, JsonSerializer.Serialize(call.Arguments)));
+                            break;
+                        case FunctionResultContent result when _entries.OfType<Entry.Called>().LastOrDefault(c => c.CallId == result.CallId) is { } called:
+                            called.Result = result.Result switch
+                            {
+                                string s => s,
+                                JsonElement { ValueKind: JsonValueKind.String } element => element.GetString(),
+                                var other => JsonSerializer.Serialize(other),
+                            };
+                            break;
+                        case TextContent t when update.Role == ChatRole.Assistant:
+                            text += t.Text;
+                            _entries.Remove(answer);
+                            answer = answer with { Text = text };
+                            _entries.Add(answer);
+                            break;
+                    }
+                }
+                StateHasChanged();
+            }
+        }
+        catch (Exception e) when (e is InvalidOperationException or NotSupportedException or HttpRequestException)
+        {
+            _entries.Add(new Entry.Said("model", $"Generation failed: {e.Message}"));
+        }
+        finally
+        {
+            _busy = false;
+        }
+    });
+}

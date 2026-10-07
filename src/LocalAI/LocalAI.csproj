@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>LocalAI</PackageId>
+    <Version>0.1.0</Version>
+    <Description>Run GGUF chat, embedding and reranking models, Whisper and Kokoro in-process, used through Microsoft.Extensions.AI. Swap any of them for a hosted model in configuration.</Description>
+    <PackageTags>llm;local;gguf;llama.cpp;whisper;kokoro;microsoft.extensions.ai</PackageTags>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- Public records and enums document themselves through their names. -->
+    <NoWarn>$(NoWarn);CS1591;CS1573</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="LocalAI.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Microsoft.Extensions.AI: the abstractions, function invocation, DI builders, hosted providers. -->
+    <PackageReference Include="Microsoft.Extensions.AI" Version="10.10.0" />
+    <PackageReference Include="Microsoft.Extensions.AI.OpenAI" Version="10.10.1" />
+    <PackageReference Include="OllamaSharp" Version="5.5.0" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="10.0.0" />
+
+    <!-- llama.cpp: chat, vision, embeddings, reranking. CPU and Vulkan backends; add
+         LLamaSharp.Backend.Cuda12 in the app for NVIDIA GPUs. -->
+    <PackageReference Include="LLamaSharp" Version="0.27.0" />
+    <PackageReference Include="LLamaSharp.Backend.Cpu" Version="0.27.0" />
+    <PackageReference Include="LLamaSharp.Backend.Vulkan" Version="0.27.0" />
+
+    <!-- whisper.cpp: speech to text. -->
+    <PackageReference Include="Whisper.net" Version="1.9.1" />
+    <PackageReference Include="Whisper.net.Runtime" Version="1.9.1" />
+    <PackageReference Include="Whisper.net.Runtime.Vulkan" Version="1.9.1" />
+
+    <!-- ONNX Runtime: Kokoro text to speech and Silero voice activity detection. -->
+    <PackageReference Include="KokoroSharp" Version="0.8.4" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.22.0" />
+
+    <!-- MP3 decoding, fully managed. -->
+    <PackageReference Include="NLayer" Version="1.16.0" />
+  </ItemGroup>
+
+</Project>

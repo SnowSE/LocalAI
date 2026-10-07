@@ -1,0 +1,11 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- MEAI's speech-to-text and text-to-speech interfaces are still marked experimental. -->
+    <NoWarn>$(NoWarn);MEAI001</NoWarn>
+  </PropertyGroup>
+</Project>

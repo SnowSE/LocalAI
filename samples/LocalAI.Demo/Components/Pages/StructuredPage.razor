@@ -1,0 +1,197 @@
+@page "/structured"
+@inherits DemoPage
+@inject LocalAIModels Models
+@inject IChatClient Chat
+
+<PageTitle>LocalAI: Structured output</PageTitle>
+
+<h1>Structured output</h1>
+<p class="lede">
+    Constrain what the model may write, token by token. Ask for a C# type and it can only produce
+    JSON that deserializes into it; give it a regular expression and every answer fits it.
+</p>
+
+<div class="split">
+    <div class="demo">
+        <ModelGate Slot="Models.Chat" ConfigKey="Chat" AutoLoad="true" Context="model">
+            <section class="panel" aria-labelledby="extract-heading">
+                <h2 id="extract-heading">Pull a contact card out of an email</h2>
+                <label class="field">
+                    <span class="field__label">Email</span>
+                    <textarea class="input" rows="6" @bind="_email" disabled="@_extracting"></textarea>
+                </label>
+                <button class="button button--primary" @onclick="Extract" disabled="@_extracting">
+                    @(_extracting ? "Extracting…" : "Extract the contact")
+                </button>
+
+                @if (_json is not null)
+                {
+                    <div class="pair">
+                        <div>
+                            <h3>What the model wrote</h3>
+                            <pre class="json"><code>@_json</code></pre>
+                        </div>
+                        <div>
+                            <h3>Deserialized as <code>ContactCard</code></h3>
+                            @if (_card is { } card)
+                            {
+                                <dl class="card">
+                                    <dt>Name</dt><dd>@card.Name</dd>
+                                    <dt>Email</dt><dd>@card.Email</dd>
+                                    <dt>Company</dt><dd>@card.Company</dd>
+                                    <dt>Wants</dt><dd>@string.Join(", ", card.Topics)</dd>
+                                    <dt>Urgent</dt><dd>@(card.Urgent ? "Yes" : "No")</dd>
+                                </dl>
+                            }
+                            else
+                            {
+                                <p class="gate__error">@_parseError</p>
+                            }
+                        </div>
+                    </div>
+                }
+            </section>
+
+            <section class="panel" aria-labelledby="classify-heading">
+                <h2 id="classify-heading">Sort reviews by sentiment</h2>
+                <p>Every answer matches <code>(positive|negative|mixed)</code>. Nothing else can be generated. (A local-model option: hosted models ignore it.)</p>
+                <button class="button button--primary" @onclick="Classify" disabled="@_classifying">
+                    @(_classifying ? "Sorting…" : "Sort the reviews")
+                </button>
+                <ul class="reviews">
+                    @foreach (var review in _reviews)
+                    {
+                        <li>
+                            <span class="tag tag--@(review.Label ?? "none")">@(review.Label ?? "unsorted")</span>
+                            <span>@review.Text</span>
+                        </li>
+                    }
+                </ul>
+            </section>
+        </ModelGate>
+    </div>
+
+    <CodeSample Code="@Code">
+        <code>GetResponseAsync&lt;T&gt;</code> is Microsoft.Extensions.AI's own: it derives a JSON schema from the type and sets <code>ChatOptions.ResponseFormat</code>. A local model turns that schema into a grammar, so the JSON always parses.
+    </CodeSample>
+</div>
+
+@code {
+    private const string Code = """
+record ContactCard(string Name, string Email,
+    string Company, string[] Topics, bool Urgent);
+
+ChatResponse<ContactCard> response =
+    await chat.GetResponseAsync<ContactCard>(email);
+ContactCard card = response.Result;
+
+// Or any regular expression (local models)
+var options = new ChatOptions()
+    .WithRegex("(positive|negative|mixed)");
+var label = (await chat.GetResponseAsync(review, options)).Text;
+""";
+
+    public sealed record ContactCard(
+        [property: Description("The sender's full name")] string Name,
+        string Email,
+        string Company,
+        [property: Description("Short phrases for what they want")] string[] Topics,
+        [property: Description("Whether they need an answer within a few days")] bool Urgent);
+
+    private sealed class Review(string text)
+    {
+        public string Text { get; } = text;
+        public string? Label { get; set; }
+    }
+
+    private string _email = """
+Hi there,
+
+I'm Priya Raman, head of platform at Fjordline Freight. We'd like to run document summarisation and invoice extraction on our own servers, since customer data can't leave our network. Could someone walk us through licensing before Friday? Our board meets Monday.
+
+Best,
+Priya (priya.raman@fjordline.example)
+""";
+
+    private readonly List<Review> _reviews =
+    [
+        new("Setup took five minutes and it has run without a hiccup for a month."),
+        new("The battery died on day two and support never wrote back."),
+        new("Great screen, but the speakers are tinny and it runs hot."),
+        new("Exactly what I needed. Already ordered a second one for my sister."),
+    ];
+
+    private bool _extracting;
+    private bool _classifying;
+    private string? _json;
+    private ContactCard? _card;
+    private string? _parseError;
+
+    private Task Extract() => Guard(async () =>
+    {
+        _extracting = true;
+        _json = null;
+        _card = null;
+        try
+        {
+            List<ChatMessage> messages =
+            [
+                new(ChatRole.System, "Extract the sender's contact details from the email."),
+                new(ChatRole.User, _email),
+            ];
+            var response = await Chat.GetResponseAsync<ContactCard>(messages, new ChatOptions { Temperature = 0 }.WithThinking(false), cancellationToken: Alive);
+            _json = Pretty(response.Text);
+            if (response.TryGetResult(out var card))
+                _card = card;
+            else
+                _parseError = "The reply didn't deserialize into a ContactCard.";
+        }
+        catch (Exception e) when (e is InvalidOperationException or NotSupportedException or HttpRequestException or JsonException)
+        {
+            _json = "";
+            _parseError = e.Message;
+        }
+        finally
+        {
+            _extracting = false;
+        }
+    });
+
+    private Task Classify() => Guard(async () =>
+    {
+        _classifying = true;
+        foreach (var review in _reviews)
+            review.Label = null;
+        try
+        {
+            var options = new ChatOptions { Temperature = 0 }.WithThinking(false).WithRegex("(positive|negative|mixed)");
+            foreach (var review in _reviews)
+            {
+                List<ChatMessage> messages =
+                [
+                    new(ChatRole.System, "Label the sentiment of the customer review."),
+                    new(ChatRole.User, review.Text),
+                ];
+                review.Label = (await Chat.GetResponseAsync(messages, options, Alive)).Text.Trim().ToLowerInvariant();
+                StateHasChanged();
+            }
+        }
+        finally
+        {
+            _classifying = false;
+        }
+    });
+
+    private static string Pretty(string json)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            return JsonSerializer.Serialize(document.RootElement, new JsonSerializerOptions { WriteIndented = true });
+        }
+        catch (JsonException)
+        {
+            return json;
+        }
+    }
+}

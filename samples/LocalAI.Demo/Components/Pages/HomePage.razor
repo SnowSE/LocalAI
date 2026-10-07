@@ -1,0 +1,191 @@
+@page "/"
+@inherits DemoPage
+@inject LocalAIModels Models
+@inject IChatClient Chat
+
+<PageTitle>LocalAI for .NET</PageTitle>
+
+<header class="hero">
+    <h1 class="hero__title">A language model, running inside this web server.</h1>
+    <p class="lede">
+        Every page here talks to <code>Microsoft.Extensions.AI</code> interfaces: <code>IChatClient</code>,
+        <code>IEmbeddingGenerator</code>, <code>ISpeechToTextClient</code>, <code>ITextToSpeechClient</code>.
+        Behind them, LocalAI loads GGUF and ONNX models into this process, so what you type never leaves
+        the machine. Point any of them at a hosted model in configuration and the pages don't change.
+    </p>
+
+    <ModelGate Slot="Models.Chat" ConfigKey="Chat" AutoLoad="true" Context="model">
+        <form class="ask" @onsubmit="Ask" @onsubmit:preventDefault>
+            <label class="ask__label" for="hero-prompt">Ask it something</label>
+            <div class="ask__row">
+                <input id="hero-prompt" class="input" @bind="_prompt" @bind:event="oninput" disabled="@_busy" autocomplete="off" />
+                @if (_busy)
+                {
+                    <button type="button" class="button" @onclick="Stop">Stop</button>
+                }
+                else
+                {
+                    <button type="submit" class="button button--primary" disabled="@string.IsNullOrWhiteSpace(_prompt)">Ask</button>
+                }
+            </div>
+        </form>
+        @if (_reply.Text.Length > 0)
+        {
+            <div class="answer" aria-live="polite">
+                <Markdown Text="@_reply.Text" />
+                @if (_tokensPerSecond is { } tps)
+                {
+                    <p class="readout">@_reply.Tokens tokens at @tps.ToString("F1") tokens per second</p>
+                }
+            </div>
+        }
+        @if (_error is not null)
+        {
+            <p class="gate__error" role="alert">@_error</p>
+        }
+    </ModelGate>
+</header>
+
+<section class="section" aria-labelledby="models-heading">
+    <h2 id="models-heading">Models</h2>
+    <p>Each model loads the first time a page needs it, and stays loaded for every visitor. Local models given as <code>hf://</code> or <code>https://</code> sources download once and are cached. Change them under <code>LocalAI</code> in <code>appsettings.json</code>.</p>
+
+    <table class="models">
+        <thead>
+            <tr><th scope="col">Model</th><th scope="col">Used for</th><th scope="col">Status</th><th scope="col"><span class="visually-hidden">Action</span></th></tr>
+        </thead>
+        <tbody>
+            @foreach (var slot in Models.All)
+            {
+                <tr>
+                    <th scope="row">
+                        @slot.Name
+                        @if (slot.State != SlotState.NotConfigured)
+                        {
+                            <span class="tag">@(slot.IsLocal ? "Local" : "Hosted")</span>
+                        }
+                        <span class="models__source">@(slot.State == SlotState.NotConfigured ? "Not set" : slot.Source)</span>
+                    </th>
+                    <td>@slot.Purpose</td>
+                    <td class="models__status">
+                        <Lamp State="slot.State" />
+                        @StatusText(slot)
+                    </td>
+                    <td>
+                        @if (slot.State is SlotState.NotLoaded or SlotState.Failed)
+                        {
+                            <button class="button button--small" @onclick="() => Load(slot)">@(slot.State == SlotState.Failed ? "Try again" : "Load")</button>
+                        }
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+</section>
+
+<section class="section" aria-labelledby="cache-heading">
+    <h2 id="cache-heading">Already downloaded</h2>
+    @if (_cached.Count == 0)
+    {
+        <p>The download cache is empty. Load a model above and it appears here.</p>
+    }
+    else
+    {
+        <p class="readout">In <code>@ModelSource.CacheDirectory</code></p>
+        <ul class="cache">
+            @foreach (var cached in _cached)
+            {
+                <li><span class="cache__path">@cached.Path</span> <span class="cache__size">@Format.Bytes(cached.Size)</span></li>
+            }
+        </ul>
+    }
+</section>
+
+@code {
+    private string _prompt = "Why do cats purr?";
+    private readonly Reply _reply = new();
+    private bool _busy;
+    private string? _error;
+    private double? _tokensPerSecond;
+    private CancellationTokenSource? _cts;
+    private IReadOnlyList<CachedModel> _cached = [];
+
+    protected override void OnInitialized()
+    {
+        foreach (var slot in Models.All)
+            slot.Changed += OnChanged;
+        RefreshCache();
+    }
+
+    private Task Ask() => Guard(async () =>
+    {
+        _busy = true;
+        _error = null;
+        _reply.Clear();
+        _tokensPerSecond = null;
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(Alive);
+        var stopwatch = new Stopwatch();
+        try
+        {
+            List<ChatMessage> messages = [new(ChatRole.System, "Answer in two or three sentences."), new(ChatRole.User, _prompt)];
+            await foreach (var update in Chat.GetStreamingResponseAsync(messages, new ChatOptions().WithThinking(false), _cts.Token))
+            {
+                if (!stopwatch.IsRunning)
+                    stopwatch.Start();
+                _reply.Add(update);
+                StateHasChanged();
+            }
+        }
+        catch (OperationCanceledException) when (!IsDisposed)
+        {
+        }
+        catch (Exception e) when (e is InvalidOperationException or NotSupportedException or HttpRequestException)
+        {
+            _error = e.Message;
+        }
+        finally
+        {
+            _busy = false;
+            _reply.Done = true;
+            _tokensPerSecond = _reply.Tokens / Math.Max(stopwatch.Elapsed.TotalSeconds, 0.001);
+        }
+    });
+
+    private void Stop() => _cts?.Cancel();
+
+    private void Load(IModelSlot slot) => _ = slot.LoadAsync().ContinueWith(_ => { }, TaskScheduler.Default);
+
+    private void OnChanged() => _ = InvokeAsync(() =>
+    {
+        RefreshCache();
+        StateHasChanged();
+    });
+
+    private void RefreshCache()
+    {
+        try
+        {
+            _cached = ModelSource.GetCachedModels();
+        }
+        catch (IOException)
+        {
+            _cached = [];
+        }
+    }
+
+    private static string StatusText(IModelSlot slot) => slot.State switch
+    {
+        SlotState.Ready => slot.IsLocal && slot.LoadTime is { } t ? $"Loaded in {t.TotalSeconds:F1} s" : "Ready",
+        SlotState.Loading when slot.Progress is { Total: > 0 } p => $"Downloading, {100.0 * p.Downloaded / p.Total:F0}%",
+        SlotState.Loading => "Loading",
+        SlotState.Failed => slot.Error ?? "Failed",
+        SlotState.NotConfigured => "Not configured",
+        _ => "Not loaded",
+    };
+
+    protected override void OnDispose()
+    {
+        foreach (var slot in Models.All)
+            slot.Changed -= OnChanged;
+    }
+}

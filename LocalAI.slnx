@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/LocalAI/LocalAI.csproj" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/LocalAI.Demo/LocalAI.Demo.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/LocalAI.Tests/LocalAI.Tests.csproj" />
+  </Folder>
+</Solution>

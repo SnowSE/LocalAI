@@ -1,0 +1,312 @@
+@page "/speech"
+@inherits DemoPage
+@inject LocalAIModels Models
+@inject ITextToSpeechClient TextToSpeech
+@inject ISpeechToTextClient SpeechToText
+@inject IVoiceActivityDetector VoiceActivity
+@inject IChatClient Chat
+
+<PageTitle>LocalAI: Speech</PageTitle>
+
+<h1>Speech</h1>
+<p class="lede">
+    Turn text into speech, find where the speaking is, and turn it back into text. With no microphone
+    needed, the loop below feeds the generated speech straight into transcription.
+</p>
+
+<div class="split">
+    <div class="demo">
+        <section class="panel" aria-labelledby="tts-heading">
+            <h2 id="tts-heading">Read text aloud</h2>
+            <ModelGate Slot="Models.TextToSpeech" ConfigKey="TextToSpeech" Context="tts">
+                @if (ShowVoices)
+                {
+                    <label class="field">
+                        <span class="field__label">Voice</span>
+                        <select class="input" @bind="_voice" @bind:after="VoiceChanged" disabled="@Busy">
+                            @foreach (var language in KokoroVoiceCatalog.All.GroupBy(v => v.Language))
+                            {
+                                <optgroup label="@language.Key.Name">
+                                    @foreach (var voice in language)
+                                    {
+                                        <option value="@voice.Id">@voice.Name, @voice.Gender</option>
+                                    }
+                                </optgroup>
+                            }
+                        </select>
+                    </label>
+                }
+                <label class="field">
+                    <span class="field__label">Text</span>
+                    <textarea class="input" rows="5" @bind="_text" disabled="@Busy"></textarea>
+                </label>
+                <div class="settings__row">
+                    <button class="button button--primary" @onclick="Speak" disabled="@(Busy || string.IsNullOrWhiteSpace(_text))">
+                        @(_speaking ? _progress : "Read it aloud")
+                    </button>
+                    @if (ShowVoices && TargetLanguage is { } target)
+                    {
+                        <button class="button" @onclick="Translate" disabled="@(Busy || string.IsNullOrWhiteSpace(_text))">
+                            @(_translating ? _progress : $"Translate into {target}")
+                        </button>
+                    }
+                </div>
+                @if (_speakError is not null)
+                {
+                    <p class="gate__error" role="alert">@_speakError</p>
+                }
+                @if (_audio is { } audio)
+                {
+                    <audio class="player" controls src="@audio.DataUrl"></audio>
+                    <p class="readout">@audio.Pcm.Duration.TotalSeconds.ToString("F1") s of audio, made in @audio.Took.TotalSeconds.ToString("F1") s</p>
+                }
+            </ModelGate>
+        </section>
+
+        <section class="panel" aria-labelledby="stt-heading">
+            <h2 id="stt-heading">Transcribe</h2>
+            <ModelGate Slot="Models.SpeechToText" ConfigKey="SpeechToText" Context="stt">
+                <div class="settings__row">
+                    <button class="button button--primary" @onclick="() => Transcribe(_audio?.Wav, SpokenLanguage)" disabled="@(Busy || _audio is null)">Transcribe the speech above</button>
+                    <label class="field">
+                        <span class="field__label">Or upload a WAV or MP3</span>
+                        <InputFile class="input" accept=".wav,.mp3,audio/wav,audio/mpeg" OnChange="Upload" disabled="@Busy" />
+                    </label>
+                </div>
+                @if (_transcript.Length > 0 || _transcribing)
+                {
+                    <p class="answer" aria-live="polite">@_transcript@(_transcribing ? "…" : "")</p>
+                }
+            </ModelGate>
+        </section>
+
+        <section class="panel" aria-labelledby="vad-heading">
+            <h2 id="vad-heading">Find the speech</h2>
+            <p>Voice activity detection marks where someone is talking, so a voice app knows when to stop listening.</p>
+            <ModelGate Slot="Models.VoiceActivity" ConfigKey="VoiceActivity" Context="vad">
+                <button class="button" @onclick="FindSpeech" disabled="@(Busy || _audio is null)">Find speech in the audio above</button>
+                @if (_segments is { } segments && _audio is { } audio)
+                {
+                    @if (segments.Count == 0)
+                    {
+                        <p>No speech found.</p>
+                    }
+                    else
+                    {
+                        <div class="timeline" role="img" aria-label="@($"{segments.Count} stretches of speech in {audio.Pcm.Duration.TotalSeconds:F1} seconds")">
+                            @foreach (var segment in segments)
+                            {
+                                <span class="timeline__speech" style="left: @Pct(segment.Start)%; width: @Pct(segment.Duration)%"></span>
+                            }
+                        </div>
+                        <p class="readout">@segments.Count stretch@(segments.Count == 1 ? "" : "es") of speech: @string.Join(", ", segments.Select(s => $"{s.Duration.TotalSeconds:F1} s"))</p>
+                    }
+                }
+            </ModelGate>
+            @if (_error is not null)
+            {
+                <p class="gate__error" role="alert">@_error</p>
+            }
+        </section>
+    </div>
+
+    <CodeSample Code="@Code" />
+</div>
+
+@code {
+    private const string Code = """
+// Translate with the chat model first, if you like
+var french = await chat.GetResponseAsync(
+    [new(ChatRole.System, "Translate into French. " +
+        "Reply with only the translation."),
+     new(ChatRole.User, text)]);
+
+// Injected: ITextToSpeechClient (Kokoro, in-process).
+// The voice's name sets its language.
+var speech = await tts.GetAudioAsync(text,
+    new TextToSpeechOptions { VoiceId = "ff_siwis" });
+var wav = speech.Contents.OfType<DataContent>().Single();
+
+// Injected: IVoiceActivityDetector (Silero)
+var segments = await vad.DetectAsync(
+    AudioData.Decode(wav.Data.Span));
+
+// Injected: ISpeechToTextClient (Whisper)
+await foreach (var update in stt.GetStreamingTextAsync(
+    new MemoryStream(wav.Data.ToArray())))
+    Console.Write(update.Text);
+""";
+
+    private sealed record Speech(byte[] Wav, string DataUrl, AudioData Pcm, TimeSpan Took);
+
+    private string _text = KokoroVoiceCatalog.Languages[1].Sample;
+    private string _voice = "";
+    private Speech? _audio;
+    private string _transcript = "";
+    private IReadOnlyList<SpeechSegment>? _segments;
+    private string? _error;
+    private string? _speakError;
+    private string _progress = "";
+    private bool _speaking;
+    private bool _transcribing;
+    private bool _finding;
+    private bool _translating;
+    private bool Busy => _speaking || _transcribing || _finding || _translating;
+
+    /// <summary>Kokoro's voices are listed only when text to speech runs locally; hosted providers have their own.</summary>
+    private bool ShowVoices => Models.TextToSpeech.IsLocal;
+
+    private string DefaultVoice => Models.Options.TextToSpeech.Voice is { Length: > 0 } voice ? voice : "af_heart";
+
+    private KokoroVoiceCatalog.Voice? SelectedVoice => KokoroVoiceCatalog.Find(_voice);
+
+    /// <summary>The language to translate into: the selected voice's, without the accent.</summary>
+    private string? TargetLanguage => SelectedVoice?.Language.Name switch
+    {
+        "American English" or "British English" => "English",
+        var name => name,
+    };
+
+    /// <summary>What Whisper should expect when transcribing the generated speech.</summary>
+    private string? SpokenLanguage => ShowVoices ? SelectedVoice?.Language.Code[..2] : null;
+
+    protected override void OnInitialized()
+    {
+        _voice = DefaultVoice;
+        if (SelectedVoice is { } voice)
+            _text = voice.Language.Sample;
+    }
+
+    /// <summary>Swap a built-in sample for one in the new voice's language; leave the visitor's own text alone.</summary>
+    private void VoiceChanged()
+    {
+        if (KokoroVoiceCatalog.Languages.Any(l => l.Sample == _text) && SelectedVoice is { } voice)
+            _text = voice.Language.Sample;
+    }
+
+    /// <summary>Translate the text box into the voice's language with the chat model, streaming it in.</summary>
+    private Task Translate() => Guard(async () =>
+    {
+        if (TargetLanguage is not { } target)
+            return;
+        _translating = true;
+        _speakError = null;
+        try
+        {
+            if (Models.Chat.State != SlotState.Ready)
+            {
+                _progress = "Loading the chat model…";
+                StateHasChanged();
+            }
+            _progress = $"Translating into {target}…";
+            List<ChatMessage> messages =
+            [
+                new(ChatRole.System, "You are a translator. Translate the user's text into the language they name. " +
+                    "Keep the meaning, tone and paragraph breaks. Reply with only the translation."),
+                new(ChatRole.User, $"Translate into {target}:\n\n{_text}"),
+            ];
+            var reply = new Reply();
+            await foreach (var update in Chat.GetStreamingResponseAsync(messages, new ChatOptions { Temperature = 0.3f }.WithThinking(false), Alive))
+            {
+                reply.Add(update);
+                if (reply.Text.Length > 0)
+                    _text = reply.Text.Trim();
+                StateHasChanged();
+            }
+        }
+        catch (Exception e) when (e is InvalidOperationException or NotSupportedException or HttpRequestException)
+        {
+            _speakError = e.Message;
+        }
+        finally
+        {
+            _translating = false;
+        }
+    });
+
+    private Task Speak() => Guard(async () =>
+    {
+        _speaking = true;
+        _speakError = null;
+        _segments = null;
+        _progress = "Synthesizing…";
+        StateHasChanged();
+        try
+        {
+            var stopwatch = Stopwatch.StartNew();
+            var options = new TextToSpeechOptions { VoiceId = ShowVoices ? _voice : null };
+            var response = await TextToSpeech.GetAudioAsync(_text, options, Alive);
+            var took = stopwatch.Elapsed;
+
+            var audio = response.Contents.OfType<DataContent>().FirstOrDefault()
+                ?? throw new InvalidOperationException("The text-to-speech model returned no audio.");
+            var wav = audio.Data.ToArray();
+            _audio = new Speech(wav, $"data:{audio.MediaType};base64,{Convert.ToBase64String(wav)}", AudioData.Decode(wav), took);
+        }
+        catch (Exception e) when (e is InvalidOperationException or NotSupportedException or ArgumentException or FormatException or HttpRequestException)
+        {
+            _speakError = e.Message;
+        }
+        finally
+        {
+            _speaking = false;
+        }
+    });
+
+    private async Task Upload(InputFileChangeEventArgs e)
+    {
+        using var buffer = new MemoryStream();
+        await e.File.OpenReadStream(maxAllowedSize: 50 * 1024 * 1024).CopyToAsync(buffer);
+        await Transcribe(buffer.ToArray(), language: null);
+    }
+
+    private Task Transcribe(byte[]? audio, string? language) => Guard(async () =>
+    {
+        if (audio is null)
+            return;
+        _transcribing = true;
+        _transcript = "";
+        _error = null;
+        try
+        {
+            var options = new SpeechToTextOptions { SpeechLanguage = language };
+            await foreach (var update in SpeechToText.GetStreamingTextAsync(new MemoryStream(audio), options, Alive))
+            {
+                _transcript += update.Text;
+                StateHasChanged();
+            }
+            _transcript = _transcript.Trim();
+        }
+        catch (Exception e) when (e is InvalidOperationException or NotSupportedException or FormatException or HttpRequestException)
+        {
+            _error = e.Message;
+        }
+        finally
+        {
+            _transcribing = false;
+        }
+    });
+
+    private Task FindSpeech() => Guard(async () =>
+    {
+        if (_audio is null)
+            return;
+        _finding = true;
+        _error = null;
+        try
+        {
+            _segments = await VoiceActivity.DetectAsync(_audio.Pcm, cancellationToken: Alive);
+        }
+        catch (Exception e) when (e is InvalidOperationException or NotSupportedException)
+        {
+            _error = e.Message;
+        }
+        finally
+        {
+            _finding = false;
+        }
+    });
+
+    private string Pct(TimeSpan time) =>
+        (100 * time.TotalSeconds / Math.Max(_audio?.Pcm.Duration.TotalSeconds ?? 1, 0.001)).ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+}

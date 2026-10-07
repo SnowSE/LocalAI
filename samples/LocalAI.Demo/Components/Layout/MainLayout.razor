@@ -1,0 +1,69 @@
+@inherits LayoutComponentBase
+@implements IDisposable
+@inject LocalAIModels Models
+
+<div class="shell">
+    <a class="skip" href="#main">Skip to the demo</a>
+
+    <nav class="side" aria-label="Demos">
+        <a class="brand" href="">
+            <span class="brand__name">LocalAI</span>
+            <span class="brand__sub">for Microsoft.Extensions.AI</span>
+        </a>
+
+        <ul class="side__list">
+            @foreach (var item in Items)
+            {
+                <li>
+                    <NavLink class="side__link" href="@item.Href" Match="@(item.Href == "" ? NavLinkMatch.All : NavLinkMatch.Prefix)">
+                        <span>@item.Label</span>
+                        @if (item.Slot is { } slot)
+                        {
+                            <Lamp State="slot.State" />
+                        }
+                    </NavLink>
+                </li>
+            }
+        </ul>
+
+        <p class="side__foot">Local models run on this machine; after one downloads, nothing it sees leaves it. Any of them can be swapped for a hosted model in <code>appsettings.json</code>.</p>
+    </nav>
+
+    <main id="main" class="main">
+        @Body
+    </main>
+</div>
+
+<div id="blazor-error-ui" data-nosnippet>
+    Something went wrong on the page.
+    <a href="." class="reload">Reload</a>
+    <button class="dismiss" aria-label="Dismiss">×</button>
+</div>
+
+@code {
+    private record Item(string Href, string Label, IModelSlot? Slot);
+
+    private Item[] Items => [
+        new("", "Overview", null),
+        new("chat", "Chat", Models.Chat),
+        new("tools", "Tool calling", Models.Chat),
+        new("structured", "Structured output", Models.Chat),
+        new("search", "Search and rerank", Models.Embeddings),
+        new("vision", "Images", Models.Vision),
+        new("speech", "Speech", Models.TextToSpeech),
+    ];
+
+    protected override void OnInitialized()
+    {
+        foreach (var slot in Models.All)
+            slot.Changed += OnChanged;
+    }
+
+    private void OnChanged() => _ = InvokeAsync(StateHasChanged);
+
+    public void Dispose()
+    {
+        foreach (var slot in Models.All)
+            slot.Changed -= OnChanged;
+    }
+}
